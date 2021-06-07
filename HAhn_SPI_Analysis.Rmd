@@ -1,0 +1,1168 @@
+---
+title: "Stress-Prospection-Intertemporal Choice: Study 1 Analysis"
+author: "Hayoung Ahn"
+date: "March 2021 (last updated June 2021)"
+output: html_document
+---
+
+```{r setup packages, include=FALSE}
+library(pracma) # for fminbnd
+library(plyr)
+#install.packages('readr')
+library(readr)
+library(ggplot2)
+library(reshape2)
+library(tidyr)
+library(Hmisc)
+library(RColorBrewer)
+library(reshape2)
+library(stringr)
+library(gplots)
+library(rstatix)
+library(plotrix)
+library(tidyverse)
+library(ggpubr)
+library(lme4)
+library(afex)
+library(tidytext)
+library(dplyr)
+```
+
+## 1. Introduction
+
+This study looks at the effects of stress on our ability to make decisions for our personal future. Through the Trier Social Stress Test and an "Imagine" cue that prompts participants to prospect about their future, we are curious to see whether stress interacts with memory to influence the decisions you make during intertemporal choice. 
+<http://rmarkdown.rstudio.com>.
+
+First, let's load in the data collected from Cognition.run (downloaded as .csv files from jsPsych task code). We'll create one big dataframe (called `bigdf`) that appends all participants' data together into matching columns.
+
+29 participants were enrolled in the study; 4 participants were excluded due to no-shows/cancellations or incomplete data. Hence, 25 participants are included in this study sample. 
+
+```{r subjects}
+# Load subjects' data ------------------------------------------------
+setwd('~/Box Sync/Bakkour-Lab/users/hayoung/stress_prospection_data/SONA_prelim_analysis')
+myfiles = list.files(path = "data", pattern = "*.csv", full.names=TRUE)
+bigdf = ldply(myfiles, read.csv)
+
+# adjust rows to indicate which choices are imagine trials 
+bigdf$imagine[2:dim(bigdf)[1]] = bigdf$ttype[1:dim(bigdf)[1]-1] 
+
+# reassign prompt values to 1 or 0 to match newer csvs' imagine columns
+bigdf$writeout[bigdf$imagine == 'imagine_writeout' | bigdf$imagine == 'describe_writeout'] <- 1 
+bigdf$writeout[bigdf$imagine == 'imagine' | bigdf$imagine == 'describe'] <- 0 
+
+bigdf$imagine[bigdf$imagine == 'imagine' | bigdf$imagine == 'imagine_writeout'] <- 1 
+bigdf$imagine[bigdf$imagine == 'describe'| bigdf$imagine == 'describe_writeout'] <- 0 
+
+#bigdf$choselater 
+bigdf$choselater[bigdf$ttype == 'choice' & bigdf$key_press == 75] <- 1
+bigdf$choselater[bigdf$ttype == 'choice' & bigdf$key_press == 74] <- 0
+
+write.csv(bigdf,'~/Box Sync/Bakkour-Lab/users/hayoung/stress_prospection_data/SONA_prelim_analysis/bigdf.csv')
+
+# Specify which subjects had their Session 1 = Stress
+subsstressfirst = c(3,6,10,11,13,16,17,20,23,24,26)
+
+```
+
+## 2. Fitting hyperbolic discounting function (k)
+
+### Define the function
+
+In order to develop a measure of "impulsivity" with intertemporal choice, we estimated the individual k-values (discounting parameter) while assuming hyperbolic discounting. We followed the tutorial here: 
+<http://alexanderfengler.github.io/neuroeconomics/K-Estimation/>. 
+
+```{r discounting function, echo=TRUE}
+# Create hyperbolic discounting functions (k) ---------------------------------
+## for a single choice
+GetPChoice = function(k,sir,ldr,delay,choice) {
+  if (choice == 75) {
+    pchoice = exp(ldr/(1 + k*delay)) / (exp(sir) + exp(ldr/(1 + k*delay)))
+  } else if (choice == 74) {
+    pchoice = (1 -  (exp(ldr/(1 + k*delay)) / (exp(sir) + exp(ldr/(1 + k*delay)))))
+  }
+  return(pchoice)
+} 
+
+# generate log likelihood (negative log to find minimization)
+## iterating over trials
+# sum negative log likelihoods to end up with a final likelihood for a given k
+GenerateLogLik = function(cur_k){
+  choiceprobs=rep(0,length(df$choice))
+  for (i in 1:length(df$choice)){
+    choiceprobs[i]=GetPChoice(cur_k,df$sir[i],df$ldr[i],df$delay[i],df$choice[i])
+  }
+  sumloglik = (-1)*(sum(log(choiceprobs)))
+  if (sumloglik==Inf){ 
+    sumloglik = 99999 #issue if this equals Inf
+  }
+  else { 
+    return(sumloglik)
+  } 
+}
+
+```
+
+### Apply function to calculate individual k's
+
+```{r calculate k}
+## Start big iterative for loop here ---------------------------------
+
+# subset the amountlater/delay/choice for subject 1 session 1 
+# get k's from the function, and save out to a new dataframe (subject, session, k-value)
+
+# define empty dataframe with three columns for iteration, group, and k
+k_df = data.frame(subject=numeric(),session=character(),prompt=character(),
+                  k=numeric(),prop.later=numeric(),mean.rt=numeric())
+split_df = data.frame(subject=numeric(),session=character(),
+                      prop.later.beginning=numeric(),prop.later.end=numeric())
+#num_subjects = length(unique(bigdf$subject))
+#num_sessions = length(unique(bigdf$session))
+
+## for subjects (each iteration is a participant) 
+for (s in unique(bigdf$subject)) {
+  if (s %in% subsstressfirst) {
+    bigdf$sessionlabel[bigdf$subject == s & bigdf$session == 1] = 'stress'
+    bigdf$sessionlabel[bigdf$subject == s & bigdf$session == 2] = 'nostress'
+  } else {
+    bigdf$sessionlabel[bigdf$subject == s & bigdf$session == 2] = 'stress'
+    bigdf$sessionlabel[bigdf$subject == s & bigdf$session == 1] = 'nostress'
+  }
+  
+  bigdf$promptlabel[bigdf$subject == s & bigdf$imagine == 1] <- 'imagine'
+  bigdf$promptlabel[bigdf$subject == s & bigdf$imagine == 0] <- 'describe'
+  
+  # calculate k within each session 
+  for (sess in c('stress', 'nostress')) {
+    validdf = bigdf[bigdf$subject == s & bigdf$sessionlabel == sess 
+                     & bigdf$ttype == 'choice' & bigdf$key_press %in% c(74,75), ]
+    validdf$choice = as.numeric(validdf$key_press)
+    validdf.beginning = validdf[validdf$trialnum %in% c(0:35),]
+    validdf.end = validdf[validdf$trialnum %in% c(36:71),]
+
+    prop.later.beginning = (length(validdf.beginning$choice[validdf.beginning$choice == 75]))/(length(validdf.beginning$choice))
+    prop.later.end = (length(validdf.end$choice[validdf.end$choice == 75]))/(length(validdf.end$choice))
+    
+    split_df = rbind(split_df, data.frame(subject=c(s), session=c(sess),
+                    prop.later.beginning=c(prop.later.beginning), prop.later.end=c(prop.later.end)))
+    
+    # calculate k within each prompt 
+    for (p in c('imagine', 'describe')) {
+      sessdf = bigdf[bigdf$subject == s & bigdf$sessionlabel == sess 
+                     & bigdf$promptlabel == p
+                     & bigdf$ttype == 'choice' & bigdf$key_press %in% c(74,75), ]
+      #numvalidtrials = length(sessdf$subject)
+      sessdf$sir = as.numeric(sessdf$amounttoday) #rep(20, numvalidtrials) # have to specify that these variables are part of sessdf, because they will be used by GenerateLogLik later
+      sessdf$ldr = as.numeric(sessdf$amountlater) 
+      sessdf$delay = as.numeric(sessdf$delay) # have to turn this list (characters) into numeric vectors to plug into function
+      sessdf$choice = as.numeric(sessdf$key_press)
+
+    # search the space of k's to find the best fitting k, $xmin (minimize likelihood)
+    #fminbnd, find minimum of single-variable function on fixed interval (0,1)
+      df = sessdf # have to specify what "df" is to input into GenerateLogLik function
+      k = fminbnd(GenerateLogLik,0,1)$xmin 
+      
+      # (num of trials where choice=75)/(numtrials)
+      prop.later = (length(sessdf$choice[sessdf$choice == 75]))/(length(sessdf$choice))
+      
+      mean.rt = mean(as.numeric(sessdf$rt))
+      
+      # save out into k_df
+      k_df = rbind(k_df, data.frame(subject=c(s),session=c(sess),prompt=c(p),
+                                    k=c(k),prop.later=c(prop.later),mean.rt=c(mean.rt)))
+      
+    } # end of prompt loop
+  } # end of sess loop 
+} # end of subject loop 
+
+# save local copy of dataframe "k_df" 
+path_out = '~/Box Sync/Bakkour-Lab/users/hayoung/stress_prospection_data/SONA_prelim_analysis/'
+fileName = paste(path_out, 'k_df.csv', sep='')
+write.csv(k_df, fileName, row.names=FALSE)
+
+
+```
+
+## 3. Calculate proportion of choices that were AmountLater
+
+Examine the proportion of choices that were "amountlater." 
+
+Each participant has a prop.later for each group (4 for each participant). Out of all the trials where they made a response, how many are amountlater choices? 
+
+In the plot: show the average of participants' prop.later in each group 
+
+```{r barplot prop.later}
+
+# Small multiple plots for each of the 25 participants 
+ggplot(k_df, aes(fill=prompt, y=prop.later, x=session)) + 
+    geom_bar(position="dodge", stat="identity") + 
+  ggtitle("Proportion of 'Amount Later' Choices for each Participant") + 
+  facet_wrap(~subject)
+
+mean(k_df$prop.later[k_df$session=='stress'])
+mean(k_df$prop.later[k_df$session=='nostress'])
+mean(k_df$prop.later[k_df$prompt=='imagine'])
+mean(k_df$prop.later[k_df$prompt=='describe'])
+
+# take the mean across participants in a group 
+grouped.mean.proplater <- tapply(k_df$prop.later, list(as.factor(k_df$prompt), as.factor(k_df$session)), mean)
+grouped.mean.proplater
+
+# Remove 'between-subject variability' 
+## within each subject, calculate mean prop.later to average out the 4 sessions per subject
+subject.mean = tapply(k_df$prop.later, list(as.factor(k_df$subject)), mean)
+sample.mean = mean(k_df$prop.later)
+
+# normalize prop.later within each subject 
+#prop.later.adj = prop.later - subject.mean + sample.mean
+counter = 1
+for (i in unique(k_df$subject)) { 
+  k_df$prop.later.adj[k_df$subject == i] = k_df$prop.later[k_df$subject == i] - subject.mean[counter] + sample.mean
+  counter = counter + 1
+}
+
+# Create within-subject error bars
+## standard deviation of adjusted prop.later 
+standard.deviation = tapply(k_df$prop.later.adj, list(as.factor(k_df$prompt), as.factor(k_df$session)), sd)
+
+# get 4 standard errors for each Group 
+standard.error = (standard.deviation)/(sqrt(length(unique(k_df$subject))))
+upper = grouped.mean.proplater + 1.96*(standard.error)
+lower = grouped.mean.proplater - 1.96*(standard.error)
+
+# this is the main part that plots the bar graph
+bp.prop.later <- barplot2(grouped.mean.proplater, beside=TRUE, 
+      main="Mean Proportion of 'Amount Later' Choices \n(Averaged Across 25 Participants)", 
+      ylim=c(0,1), col=c("lightblue", "mistyrose"), 
+      plot.ci=TRUE, ci.u=upper, ci.l=lower,
+      #names.arg = c("Stress Imagine", "Stress Describe", "Nostress Imagine", "Nostress Describe"),
+      xlab="Session", ylab="Mean Proportion of 'Amount Later' Choices",
+      legend=c("Describe","Imagine"))
+      #args.legend=list(title="Prompt", x="topright", cex=.7))
+
+text(bp.prop.later, 0, round(grouped.mean.proplater,3), cex=1, pos=3)
+
+# mathsd = tapply(k_df$prop.later, list(as.factor(k_df$prompt), as.factor(k_df$session)), sd)
+# upper = grouped.mean + 1.96*(mathsd)
+# lower = grouped.mean - 1.96*(mathsd)
+```
+
+## 4. Calculate k (discounting parameter)
+
+Now let's plot the k values for the four groups. For error bars, we want to make sure to plot within-subject error bars and not between-subjects. 
+
+Refer to this link for a step-by-step tutorial: 
+http://www.cogsci.nl/blog/tutorials/156-an-easy-way-to-create-graphs-with-within-subject-error-bars
+
+```{r barplot average k}
+# take the mean across participants in a group 
+grouped.mean.k <- tapply(k_df$k, list(as.factor(k_df$prompt), as.factor(k_df$session)), mean)
+grouped.mean.k
+
+# Remove 'between-subject variability' 
+## within each subject, calculate mean prop.later to average out the 4 sessions per subject
+subject.mean = tapply(k_df$k, list(as.factor(k_df$subject)), mean)
+sample.mean = mean(k_df$k)
+
+# normalize prop.later within each subject 
+#k.adj = k - subject.mean + sample.mean
+counter = 1
+for (i in unique(k_df$subject)) { 
+  k_df$k.adj[k_df$subject == i] = k_df$k[k_df$subject == i] - subject.mean[counter] + sample.mean
+  counter = counter + 1
+}
+
+# Create within-subject error bars
+## standard deviation of adjusted prop.later 
+standard.deviation = tapply(k_df$k.adj, list(as.factor(k_df$prompt), as.factor(k_df$session)), sd)
+
+# get 4 standard errors for each Group 
+standard.error = (standard.deviation)/(sqrt(length(unique(k_df$subject))))
+upper = grouped.mean.k + 1.96*(standard.error)
+lower = grouped.mean.k - 1.96*(standard.error)
+
+# this is the main part that plots the bar graph 
+bp.k <- barplot2(grouped.mean.k, beside=TRUE, 
+      main="Mean k Discounting Factor \n(Averaged Across 25 Participants)",
+      col=c("lightblue", "mistyrose"), 
+      plot.ci=TRUE, ci.u=upper, ci.l=lower,
+      xlab="Session", ylab="Mean k",
+      legend=c("Describe","Imagine"))
+
+text(bp.k, 0, round(grouped.mean.k,3), cex=1, pos=3)
+
+```
+
+## 5. Restrict data to writeout-trials only: Calculate prop.later and k 
+
+Let's start to restrict the data to see if any other patterns come up. What if we restricted the data to trials where participants are instructed to write out their responses (untimed), instead of simply thinking about it in their heads? Is there a change in the effect at all? Only include writeout trials (where writeout == 1). 
+
+Note that this is a much smaller trial sample because each participant had 12 writeout trials per session. Code not shown in Rmd output for simplicity. 
+
+```{r, echo=FALSE}
+# define empty dataframe with three columns for iteration, group, and k
+k_df_writeout = data.frame(subject=numeric(),session=character(),prompt=character(),
+                  k=numeric(),prop.later=numeric(),mean.rt=numeric())
+
+## for subjects (each iteration is a participant) 
+for (s in unique(bigdf$subject)) {
+  if (s %in% subsstressfirst) {
+    bigdf$sessionlabel[bigdf$subject == s & bigdf$session == 1] = 'stress'
+    bigdf$sessionlabel[bigdf$subject == s & bigdf$session == 2] = 'nostress'
+  } else {
+    bigdf$sessionlabel[bigdf$subject == s & bigdf$session == 2] = 'stress'
+    bigdf$sessionlabel[bigdf$subject == s & bigdf$session == 1] = 'nostress'
+  }
+  
+  bigdf$promptlabel[bigdf$subject == s & bigdf$imagine == 1] <- 'imagine'
+  bigdf$promptlabel[bigdf$subject == s & bigdf$imagine == 0] <- 'describe'
+  
+  # calculate k within each session 
+  for (sess in c('stress', 'nostress')) {
+    
+    # calculate k within each prompt 
+    for (p in c('imagine', 'describe')) {
+      sessdf_writeout = bigdf[bigdf$subject == s & bigdf$sessionlabel == sess 
+                     & bigdf$promptlabel == p
+                     & bigdf$writeout == 1
+                     & bigdf$ttype == 'choice' & bigdf$key_press %in% c(74,75), ]
+      sessdf_writeout$sir = as.numeric(sessdf_writeout$amounttoday) #rep(20, numvalidtrials) # have to specify that these variables are part of sessdf, because they will be used by GenerateLogLik later
+      sessdf_writeout$ldr = as.numeric(sessdf_writeout$amountlater) 
+      sessdf_writeout$delay = as.numeric(sessdf_writeout$delay) # have to turn this list (characters) into numeric vectors to plug into function
+      sessdf_writeout$choice = as.numeric(sessdf_writeout$key_press)
+
+    # search the space of k's to find the best fitting k, $xmin (minimize likelihood)
+    #fminbnd, find minimum of single-variable function on fixed interval (0,1)
+      df = sessdf_writeout # have to specify what "df" is to input into GenerateLogLik function
+      k = fminbnd(GenerateLogLik,0,1)$xmin 
+      
+      # (num of trials where choice=75)/(numtrials)
+      prop.later = (length(sessdf_writeout$choice[sessdf_writeout$choice == 75]))/(length(sessdf_writeout$choice))
+      
+      mean.rt = mean(as.numeric(sessdf_writeout$rt))
+      
+      # save out into k_df
+      k_df_writeout = rbind(k_df_writeout, data.frame(subject=c(s),session=c(sess),prompt=c(p),
+                                    k=c(k),prop.later=c(prop.later),mean.rt=c(mean.rt)))
+      
+    } # end of prompt loop
+  } # end of sess loop 
+} # end of subject loop 
+```
+
+
+
+Now that we've restricted the data to only take writeout trials, let's plot prop.later (proportion of choices that were the AmountLater choice and not the $20 today). 
+
+```{r, echo=FALSE}
+# take the mean across participants in a group 
+grouped.mean.proplater.writeout <- tapply(k_df_writeout$prop.later, list(as.factor(k_df_writeout$prompt), as.factor(k_df_writeout$session)), mean)
+grouped.mean.proplater.writeout
+
+# Remove 'between-subject variability' 
+## within each subject, calculate mean prop.later to average out the 4 sessions per subject
+subject.mean = tapply(k_df_writeout$prop.later, list(as.factor(k_df_writeout$subject)), mean)
+sample.mean = mean(k_df_writeout$prop.later)
+
+# normalize prop.later within each subject 
+#prop.later.adj = prop.later - subject.mean + sample.mean
+counter = 1
+for (i in unique(k_df_writeout$subject)) { 
+  k_df_writeout$prop.later.adj[k_df_writeout$subject == i] = k_df_writeout$prop.later[k_df_writeout$subject == i] - subject.mean[counter] + sample.mean
+  counter = counter + 1
+}
+
+# Create within-subject error bars
+## standard deviation of adjusted prop.later 
+standard.deviation = tapply(k_df_writeout$prop.later.adj, list(as.factor(k_df_writeout$prompt), as.factor(k_df_writeout$session)), sd)
+
+# get 4 standard errors for each Group 
+standard.error = (standard.deviation)/(sqrt(length(unique(k_df_writeout$subject))))
+upper = grouped.mean.proplater.writeout + 1.96*(standard.error)
+lower = grouped.mean.proplater.writeout - 1.96*(standard.error)
+
+bp.prop.later <- barplot2(grouped.mean.proplater.writeout, beside=TRUE, 
+      main="Only Writeout: Mean Proportion of 'Amount Later' Choices \n(Averaged Across Participants)", 
+      ylim=c(0,1), col=c("lightblue", "mistyrose"), 
+      plot.ci=TRUE, ci.u=upper, ci.l=lower,
+      #names.arg = c("Stress Imagine", "Stress Describe", "Nostress Imagine", "Nostress Describe"),
+      xlab="Session", ylab="Mean Proportion of 'Amount Later' Choices",
+      legend=c("Describe","Imagine"))
+      #args.legend=list(title="Prompt", x="topright", cex=.7))
+
+text(bp.prop.later, 0, round(grouped.mean.proplater.writeout,3), cex=1, pos=3)
+```
+
+Likewise, now that we've restricted the data to only take writeout trials, let's plot k (discounting parameter). 
+
+```{r, echo=FALSE}
+# take the mean across participants in a group 
+grouped.mean.k.writeout <- tapply(k_df_writeout$k, list(as.factor(k_df_writeout$prompt), as.factor(k_df_writeout$session)), mean)
+grouped.mean.k.writeout
+
+# Remove 'between-subject variability' 
+## within each subject, calculate mean prop.later to average out the 4 sessions per subject
+subject.mean = tapply(k_df_writeout$k, list(as.factor(k_df_writeout$subject)), mean)
+sample.mean = mean(k_df_writeout$k)
+
+# normalize prop.later within each subject 
+#k.adj = k - subject.mean + sample.mean
+counter = 1
+for (i in unique(k_df_writeout$subject)) { 
+  k_df_writeout$k.adj[k_df_writeout$subject == i] = k_df_writeout$k[k_df_writeout$subject == i] - subject.mean[counter] + sample.mean
+  counter = counter + 1
+}
+
+# Create within-subject error bars
+## standard deviation of adjusted prop.later 
+standard.deviation = tapply(k_df_writeout$k.adj, list(as.factor(k_df_writeout$prompt), as.factor(k_df_writeout$session)), sd)
+
+# get 4 standard errors for each Group 
+standard.error = (standard.deviation)/(sqrt(length(unique(k_df_writeout$subject))))
+upper = grouped.mean.k.writeout + 1.96*(standard.error)
+lower = grouped.mean.k.writeout - 1.96*(standard.error)
+
+bp.k <- barplot2(grouped.mean.k.writeout, beside=TRUE, 
+      main="Only Writeout: Mean k Discounting Factor \n(Averaged Across Participants)",
+      col=c("lightblue", "mistyrose"), 
+      plot.ci=TRUE, ci.u=upper, ci.l=lower,
+      xlab="Session", ylab="Mean k",
+      legend=c("Describe","Imagine"))
+
+text(bp.k, 0, round(grouped.mean.k.writeout,3), cex=1, pos=3)
+```
+
+## 6. Model the data? 
+
+Run two-way repeated measures ANOVA to see main effect of stress / imagine; interaction of stress*imagine
+
+```{r}
+#k.aov <- anova_test(data = k_df, dv = k, wid = subject, within = c(session, prompt))
+#get_anova_table(k.aov)
+
+# k.aov <- aov(k ~ session*prompt, data = k_df)
+# summary(k.aov) 
+# par(mfrow=c(2,2)) 
+# plot(k.aov)
+```
+
+repeated measures t-test within prompt, within session [subset the data]
+(imagine-describe) within stress, one-sample t-test on the difference 
+
+Is there any significant difference in mean k during imagine trials vs. describe trials?
+Is there any significant difference in mean k during stress sessions vs. no-stress sessions?
+
+```{r}
+# t-test within prompt 
+imagine <- k_df[k_df$prompt == 'imagine',]$k
+describe <- k_df[k_df$prompt == 'describe',]$k
+
+t.test(imagine, describe, paired=TRUE, alternative="two.sided") 
+
+# t-test within session 
+stress <- k_df[k_df$session == 'stress',]$k
+nostress <- k_df[k_df$session == 'nostress',]$k
+
+t.test(stress, nostress, paired=TRUE, alternative="two.sided") 
+
+```
+
+### Generalized Linear Mixed-Effects Model 
+
+- interaction logistic regression model; mixed effects model with random effects for interaction
+input is 1's for choselater and 0's for chosenow. binomial family (1 and 0). tend to not converge, but let's test it anyway. 
+
+glmer(choice ~ session*imagine + (session*imagine | subject), data = bigdf, family='binomial')
+
+variables from bigdf: 
+subject 
+choselater (1,0)
+sessionlabel (stress, nostress)
+promptlabel (imagine, describe, NA)
+
+```{r mixed effects model}
+mod = glmer(choselater ~ sessionlabel*promptlabel + (sessionlabel*promptlabel | subject), data = bigdf, family='binomial') 
+summary(mod)
+```
+
+## 7. Alternative plots for k, the discounting factor 
+
+Possible visualizations: 
+
+* proportion of times that you choose later (1s and 0s)
+* regression models 
+* raincloud plot to visualize variability in k's: (imagine - describe) for stress session & no-stress session 
+* use lines to connect subject data points 
+* barplot with individual plot points connected
+
+```{r, echo=FALSE}
+source("https://gist.githubusercontent.com/benmarwick/2a1bb0133ff568cbe28d/raw/fb53bd97121f7f9ce947837ef1a4c65a73bffb3f/geom_flat_violin.R")
+
+raincloud_theme = theme(
+  text = element_text(size = 10),
+  axis.title.x = element_text(size = 16),
+  axis.title.y = element_text(size = 16),
+  axis.text = element_text(size = 14),
+  axis.text.x = element_text(angle = 45, vjust = 0.5),
+  legend.title=element_text(size=16),
+  legend.text=element_text(size=16),
+  legend.position = "right",
+  plot.title = element_text(lineheight=.8, face="bold", size = 16),
+  panel.border = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.grid.major = element_blank(),
+  axis.line.x = element_line(colour = 'black', size=0.5, linetype='solid'),
+  axis.line.y = element_line(colour = 'black', size=0.5, linetype='solid'))
+```
+
+### How do individual participants' discounting factors (k) change between their two sessions? 
+
+For each participant: average k across imagine and across describe. Plot stress vs. nostress on x-axis, adding lines to connect subjects' data points.  
+
+```{r visualizations}
+# Visualizations -----------------------------------------------------------
+
+# raincloud plot 
+ggplot(data = k_df, aes(y = k, x = session, fill = session)) +
+  geom_flat_violin(position = position_nudge(x = .2, y = 0), alpha = .8) +
+  geom_point(aes(y = k, color = session), position = position_jitter(width = .15), size = .5, alpha = 0.8) +
+  geom_boxplot(width = .1, guides = FALSE, outlier.shape = NA, alpha = 0.5) +
+  expand_limits(x = 5.25) +
+  guides(fill = FALSE) +
+  guides(color = FALSE) +
+  scale_color_brewer(palette = "Spectral") +
+  scale_fill_brewer(palette = "Spectral") +
+  #coord_flip() +
+  theme_bw() +
+  raincloud_theme # raincloud_theme defined in 'Set up packages' section
+
+# scatterplot 
+ggplot(data = k_df, aes(x=session, y=k, label=subject, color=prompt)) +
+  geom_point(aes(color=prompt)) +
+  geom_text(vjust = "bottom", hjust = "right", color='black') +
+  #coord_cartesian(ylim = c(0, 0.2)) +
+  theme(panel.grid.minor.x=element_blank(),
+          panel.grid.major.x=element_blank()) +
+  labs(title="Individual k in Stress vs. Control",
+       x="Session Type", y="k value (Impulsivity)") +
+  geom_line(aes(group = interaction(subject,prompt))) #paired lines based on both subject AND prompt
+```
+
+mean(session_diff_imagine) = 0.03619148
+
+mean(session_diff_describe) = 0.02610803
+
+```{r}
+# change in k = (imagine - describe)
+prompt_diff_stress <- k_df[k_df$session == 'stress' & k_df$prompt == 'imagine',]$k - k_df[k_df$session == 'stress' & k_df$prompt == 'describe',]$k 
+prompt_diff_nostress <- k_df[k_df$session == 'nostress' & k_df$prompt == 'imagine',]$k - k_df[k_df$session == 'nostress' & k_df$prompt == 'describe',]$k 
+plot(prompt_diff_stress, col = 'red', pch=1, 
+     main="Change in k: (Imagine - Describe)", ylab=expression(paste(Delta,"k for Imagine - Describe")))
+points(prompt_diff_nostress, col = 'blue', pch=4)
+legend(1, 0.8, legend=c("Stress", "No stress"),
+       col=c("red", "blue"), pch=c(1,4))
+#text(prompt_diff_stress, labels=k_df$subject)
+
+# change in k = (stress - nostress)
+##(stress - nostress) in describe, (stress - nostress) in imagine
+
+session_diff_imagine <- k_df[k_df$session == 'stress' & k_df$prompt == 'imagine',]$k - k_df[k_df$session == 'nostress' & k_df$prompt == 'imagine',]$k 
+session_diff_describe <- k_df[k_df$session == 'stress' & k_df$prompt == 'describe',]$k - k_df[k_df$session == 'nostress' & k_df$prompt == 'describe',]$k 
+plot(session_diff_imagine, col = 'red', pch=1, ylim=c(-.15,.70), 
+     main="Change in k: (Stress - Nostress)", ylab=expression(paste(Delta,"k for Stress - Nostress")))
+points(session_diff_describe, col = 'blue', pch=4)
+legend(1, 0.7, legend=c("Imagine", "Describe"),
+       col=c("red", "blue"), pch=c(1,4))
+#text(session_diff_imagine, labels=k_df$subject)
+
+## plot change in k between sessions vs. Imagine/Describe, like above ggplot 
+k_session_diff <- k_df[k_df$session == 'stress',]$k - k_df[k_df$session == 'nostress',]$k 
+```
+
+```{r}
+# change in k = (imagine - describe). comparing delta k in stress session vs. nostress session. 
+t.test(prompt_diff_stress, prompt_diff_nostress)
+
+# change in k = (stress - nostress). comparing delta k in imagine vs. describe trials.
+t.test(session_diff_imagine, session_diff_describe)
+
+# one-sample t-test on just the (imagine-describe) for stress session 
+t.test(prompt_diff_stress)
+```
+
+## 8. Analyze Questionnaire Results
+
+In the task, we collected participants' responses to a few questionnaires: 
+
+**Session 1:** 
+
+* Pre-task: 
+  + BFNE
+  + PSS
+  + State version of PANAS
+  + State version of STAI 
+
+* Post-task: 
+  + Demographics questionnaire
+  + State version of PANAS
+  + State version of STAI 
+
+**Session 2:** 
+
+* Pre-task: 
+  + State version of PANAS
+  + State version of STAI 
+
+* Post-task: 
+  + State version of PANAS
+  + State version of STAI 
+
+### STAI Questionnaire
+
+Are participants' state anxiety levels actually affected by the TSST? To test this, we need to compare participants' anxiety scores between Session 1 and Session 2. 
+
+```{r STAI questionnaire}
+# ALL STAI QUESTIONNAIRES 
+stai_subdf <- bigdf[bigdf$ttype == 'stai-1' | bigdf$ttype == 'stai-2', ]
+stai_responses <- stai_subdf$responses
+
+# edit contents of the cell to just have numbers 
+stai_responses <- str_replace(stai_responses, "[}]", "") # replace last bracket with nothing 
+stai_responses_split <- noquote(strsplit(stai_responses, "\\,|\\:")) # split by commas and colons
+stai_responses_flat <- as.numeric(unlist(noquote(strsplit(stai_responses, "\\,|\\:")))) 
+stai_responses_flat <- stai_responses_flat[c(FALSE, TRUE)] # removes every other False value (extract every other column / element)
+# create data.frame
+stai_scores <- data.frame(matrix(stai_responses_flat, nrow=length(stai_responses_split), byrow=TRUE))
+# rename columns in df
+colnames(stai_scores) <- c("stai_q1","stai_q2","stai_q3","stai_q4","stai_q5","stai_q6","stai_q7",
+  "stai_q8","stai_q9","stai_q10","stai_q11","stai_q12","stai_q13","stai_q14","stai_q15",
+  "stai_q16","stai_q17","stai_q18","stai_q19","stai_q20")
+# +1 to each numeric value in the cell 
+stai_scores <- stai_scores + 1
+# reverse 10 anxiety-absent items in desired columns 
+reverse_cols = c('stai_q1', 'stai_q2', 'stai_q5', 'stai_q8', 'stai_q10', 'stai_q11', 'stai_q15', 'stai_q16', 'stai_q19', 'stai_q20')
+stai_scores[,reverse_cols] = 5 - stai_scores[ ,reverse_cols]
+
+# calculate total sum of points 
+for (i in 1:nrow(stai_scores)) { 
+  stai_scores$total[i] <- sum(stai_scores[i,1:20])
+}
+
+# create stai_df dataframe
+subject <- stai_subdf$subject[stai_subdf$ttype == 'stai-1']
+session <- stai_subdf$sessionlabel[stai_subdf$ttype == 'stai-1']
+pretask <- stai_scores$total[stai_subdf$ttype == 'stai-1']
+posttask <- stai_scores$total[stai_subdf$ttype == 'stai-2']
+diff <- posttask-pretask
+stai_df <- data.frame(subject=c(subject), session=c(session), pretask=c(pretask), posttask=c(posttask), diff=c(diff))
+#stai_df
+```
+
+mean(diff_stress) = -0.52
+
+mean(diff_nostress) = -3.72
+
+* Black lines: these subjects had Nostress Session1, Stress Session2
+* Gray lines: these subjects had Stress Session1, Nostress Session2
+
+```{r plot stai diff}
+# plot diff in stress vs. nostress 
+diff_stress <- stai_df$diff[stai_df$session == 'stress']
+diff_nostress <- stai_df$diff[stai_df$session == 'nostress']
+#plot(stai_df$session, stai_df$diff)
+
+# Comparing Sessions
+ggplot(stai_df, aes(x=as.factor(session), y=diff, color=subject)) + 
+  geom_point() + 
+  labs(y = "STAI Difference between Post- and Pre-task", x = "Session", 
+       title="Change in STAI Scores Across Sessions") + 
+  scale_color_gradient(low="blue", high="red") + 
+  geom_line(aes(group=interaction(subject))) #paired lines based on subject
+
+# Comparing Subjects
+ggplot(stai_df, aes(x=as.factor(subject), y=diff, color=session)) + 
+  geom_point() + 
+  labs(y = "STAI Difference between Post- and Pre-task", x = "Subject", 
+       title="Change in STAI Scores Across Subjects") + 
+  scale_color_grey() + theme_classic() + 
+  geom_line(aes(group=interaction(subject))) #paired lines based on subject
+
+```
+
+### Perceived Stress Scale 
+10 questions; reverse score Questions 4, 5, 7, 8
+
+```{r PSS}
+pss_subdf <- bigdf[bigdf$ttype == 'pss', ]
+pss_responses <- pss_subdf$responses
+
+# edit contents of the cell to just have numbers 
+pss_responses <- str_replace(pss_responses, "[}]", "") # replace last bracket with nothing 
+pss_responses_split <- noquote(strsplit(pss_responses, "\\,|\\:")) # split by commas and colons
+pss_responses_flat <- as.numeric(unlist(noquote(strsplit(pss_responses, "\\,|\\:")))) 
+pss_responses_flat <- pss_responses_flat[c(FALSE, TRUE)] # removes every other False value (extract every other column / element)
+# create data.frame
+pss_scores <- data.frame(matrix(pss_responses_flat, nrow=length(pss_responses_split), byrow=TRUE))
+# rename columns in df
+colnames(pss_scores) <- c("pss_q1","pss_q2","pss_q3","pss_q4","pss_q5","pss_q6","pss_q7",
+  "pss_q8","pss_q9","pss_q10")
+
+# reverse 4 stress-absent items in desired columns 
+reverse_cols = c('pss_q4', 'pss_q5', 'pss_q7', 'pss_q8')
+pss_scores[,reverse_cols] = 4 - pss_scores[ ,reverse_cols]
+
+# calculate total sum of points 
+for (i in 1:nrow(pss_scores)) { 
+  pss_scores$total[i] <- sum(pss_scores[i,1:10])
+}
+
+# create pss_df dataframe
+subject <- pss_subdf$subject[pss_subdf$ttype == 'pss']
+score <- pss_scores$total[pss_subdf$ttype == 'pss']
+pss_df <- data.frame(subject=c(subject), score=c(score))
+
+for (i in 1:nrow(pss_df)) {
+  if (pss_df$score[i] %in% c(0:13)) {
+    pss_df$traitstress[i] <- "low stress"
+  } else if (pss_df$score[i] %in% c(14:26)) {
+    pss_df$traitstress[i] <- "moderate stress"
+  } else if (pss_df$score[i] %in% c(27:40)) {
+    pss_df$traitstress[i] <- "high perceived stress"
+  } 
+}
+```
+
+#### Relating Trait-level with State-level Stress
+
+```{r}
+# difference of STAI diff_nostress & diff_stress
+session_diff <- diff_stress - diff_nostress
+
+tsstlm <- lm(pss_df$score ~ session_diff)
+summary(tsstlm)
+
+# plot correlation between each participant's trait stress and session_diff (PSS trait ~ session_diff)
+plot(pss_df$score ~ session_diff, col='black', pch=1, main="Relating each participant's trait stress and state stress", ylab="Perceived Stress Scale Score", xlab="Difference of STAI Score Change Between Sessions")
+abline(tsstlm, col='red')
+
+```
+
+#### Relating state anxiety with proportion of choosing later reward 
+
+k diff between sessions ~ STAI 
+
+mixed effects model -> extract random effects (single Beta for each subject from glmer) -> relate this to STAI 
+
+```{r}
+
+# first find each participant's average prop.later for each session. (Each participant should have 2 items) 
+session.mean.prop <- tapply(k_df$prop.later, list(as.factor(k_df$subject), as.factor(k_df$session)), mean)
+prop.mat <- melt(session.mean.prop, value.name="session.mean.prop", varnames=c('subject','session'))
+
+prop_df <- data.frame(prop.mat)
+stai_proplater_df <- merge(stai_df, prop_df) # join two dataframes with different col names 
+
+ggplot(stai_proplater_df, aes(x=diff, y=session.mean.prop, color=session)) + 
+  geom_point() + 
+  labs(x = "STAI Difference between Post- and Pre-task", y = "Proportion of Choosing Later Amount", 
+       title="Relating Stress with Choosing Later Amount") 
+  #scale_color_gradient(low="blue", high="red") 
+
+plot(diff, session.mean.prop)
+cor(stai_proplater_df$diff, stai_proplater_df$session.mean.prop)
+
+
+diff_stress <- k_df$prop.later[k_df$session == 'stress']
+diff_nostress <- k_df$prop.later[k_df$session == 'nostress']
+session_diff_proplater = diff_stress - diff_nostress
+
+# relate this to session_diff from stai_df 
+# session_diff_proplater ~ stai_df$session_diff
+```
+
+### Positive and Negative Affect Schedule [IN PROGRESS] 
+
+We can apply a similar structure to the PANAS questionnaires: 
+
+```{r PANAS questionnaire, eval=FALSE}
+panas_subdf <- bigdf[bigdf$ttype == 'panas-1' | bigdf$ttype == 'panas-2', ]
+panas_responses <- panas_subdf$responses
+
+# edit contents of the cell to just have numbers 
+panas_responses <- str_replace(panas_responses, "[}]", "") # replace last bracket with nothing 
+panas_responses_split <- noquote(strsplit(panas_responses, "\\,|\\:")) # split by commas and colons
+panas_responses_flat <- as.numeric(unlist(noquote(strsplit(panas_responses, "\\,|\\:")))) 
+panas_responses_flat <- panas_responses_flat[c(FALSE, TRUE)] # removes every other False value (extract every other column / element)
+# create data.frame
+panas_scores <- data.frame(matrix(panas_responses_flat, nrow=length(panas_responses_split), byrow=TRUE))
+# rename columns in df
+colnames(panas_scores) <- c("panas_q1","panas_q2","panas_q3","panas_q4","panas_q5","panas_q6","panas_q7",
+  "panas_q8","panas_q9","panas_q10","panas_q11","panas_q12","panas_q13","panas_q14","panas_q15",
+  "panas_q16","panas_q17","panas_q18","panas_q19","panas_q20")
+# +1 to each numeric value in the cell 
+panas_scores <- panas_scores + 1
+
+# Positive Affect
+positive_cols = c('panas_q1', 'panas_q3', 'panas_q5', 'panas_q9', 'panas_q10', 'panas_q12', 'panas_q14', 'panas_q16', 'panas_q17', 'panas_q19') 
+pos_panas <- panas_scores[,positive_cols]
+
+# Negative Affect 
+negative_cols = c('panas_q2', 'panas_q4', 'panas_q6', 'panas_q7', 'panas_q8', 'panas_q11', 'panas_q13', 'panas_q15', 'panas_q18', 'panas_q20')
+neg_panas <- panas_scores[,negative_cols]
+
+# calculate total sum of points 
+for (i in 1:nrow(pos_panas)) { 
+  pos_panas$total[i] <- sum(pos_panas[i,1:10])
+}
+
+for (i in 1:nrow(neg_panas)) { 
+  neg_panas$total[i] <- sum(neg_panas[i,1:10])
+}
+
+# create panas_df dataframe
+subject <- panas_subdf$subject[panas_subdf$ttype == 'panas-1']
+session <- panas_subdf$sessionlabel[panas_subdf$ttype == 'panas-1']
+pretask <- panas_scores$total[panas_subdf$ttype == 'panas-1']
+posttask <- panas_scores$total[panas_subdf$ttype == 'panas-2']
+diff <- posttask-pretask
+panas_df <- data.frame(subject=c(subject), session=c(session), pretask=c(pretask), posttask=c(posttask), diff=c(diff))
+#panas_df
+
+# compare pos to pos, neg to neg? 
+
+```
+
+### Brief Fear of Negative Evaluation Scale [IN PROGRESS] 
+
+And the BFNE Questionnaire: 
+
+
+
+## 9. Restricting participants included in analyses
+### Subset participants based on STAI scores
+
+Identify the participants who were "actually" impacted by the TSST (according to change in STAI scores). This only includes participants whose STAI scores increased more during Stress sessions than during No-stress sessions. 
+
+From 25 total included participants, 16 participants were impacted by the TSST:
+[subject %in% c(1,6,7,9,12,13,14,15,16,19,20,21,24,25,26,29), ] 
+
+By counterbalanced design, 11 participants experienced the TSST in their Session 1, and 14 experienced the TSST in Session 2. 
+TSST in Session1: c(3,6,10,11,13,16,17,20,23,24,26) 
+
+Out of 11 with TSST in Session 1, 6 were impacted (and showed a higher positive change in STAI scores). Out of 14 with TSST in Session 2, 10 were impacted. 
+
+Out of the 16 participants who were impacted by the TSST, 6 of those had TSST in Session 1 (6, 13, 16, 20, 24, 26). The other 10 had TSST in Session 2.
+
+```{r}
+stressed_subjects = vector()
+
+for (s in unique(stai_df$subject)) {
+  if (stai_df[stai_df$subject == s & stai_df$session == 'stress',]$diff > stai_df[stai_df$subject == s & stai_df$session == 'nostress',]$diff) { 
+    stressed_subjects = c(stressed_subjects, s) 
+  }
+}
+
+stressed_subjects
+```
+
+
+Let's look at prop.later and k again, but only for the participants who were impacted by the TSST: 
+
+```{r}
+k_df_valid <- k_df[k_df$subject %in% c(1,6,7,9,12,13,14,15,16,19,20,21,24,25,26,29), ]
+
+# take the mean across participants in a group 
+grouped.mean.proplater <- tapply(k_df_valid$prop.later, list(as.factor(k_df_valid$prompt), as.factor(k_df_valid$session)), mean)
+grouped.mean.proplater
+
+# Remove 'between-subject variability' 
+## within each subject, calculate mean prop.later to average out the 4 sessions per subject
+subject.mean = tapply(k_df_valid$prop.later, list(as.factor(k_df_valid$subject)), mean)
+sample.mean = mean(k_df_valid$prop.later)
+
+# normalize prop.later within each subject 
+#prop.later.adj = prop.later - subject.mean + sample.mean
+counter = 1
+for (i in unique(k_df_valid$subject)) { 
+  k_df_valid$prop.later.adj[k_df_valid$subject == i] = k_df_valid$prop.later[k_df_valid$subject == i] - subject.mean[counter] + sample.mean
+  counter = counter + 1
+}
+
+# Create within-subject error bars
+## standard deviation of adjusted prop.later 
+standard.deviation = tapply(k_df_valid$prop.later.adj, list(as.factor(k_df_valid$prompt), as.factor(k_df_valid$session)), sd)
+
+# get 4 standard errors for each Group 
+standard.error = (standard.deviation)/(sqrt(length(unique(k_df_valid$subject))))
+upper = grouped.mean.proplater + 1.96*(standard.error)
+lower = grouped.mean.proplater - 1.96*(standard.error)
+
+bp.prop.later <- barplot2(grouped.mean.proplater, beside=TRUE, 
+      main="Mean Proportion of 'Amount Later' Choices \n(Averaged Across 16 Participants)", 
+      ylim=c(0,1), col=c("lightblue", "mistyrose"), 
+      plot.ci=TRUE, ci.u=upper, ci.l=lower,
+      #names.arg = c("Stress Imagine", "Stress Describe", "Nostress Imagine", "Nostress Describe"),
+      xlab="Session", ylab="Mean Proportion of 'Amount Later' Choices",
+      legend=c("Describe","Imagine"))
+      #args.legend=list(title="Prompt", x="topright", cex=.7))
+
+text(bp.prop.later, 0, round(grouped.mean.proplater,3), cex=1, pos=3)
+```
+```{r}
+# take the mean across participants in a group 
+grouped.mean.k <- tapply(k_df_valid$k, list(as.factor(k_df_valid$prompt), as.factor(k_df_valid$session)), mean)
+grouped.mean.k
+
+# Remove 'between-subject variability' 
+## within each subject, calculate mean prop.later to average out the 4 sessions per subject
+subject.mean = tapply(k_df_valid$k, list(as.factor(k_df_valid$subject)), mean)
+sample.mean = mean(k_df_valid$k)
+
+# normalize prop.later within each subject 
+#k.adj = k - subject.mean + sample.mean
+counter = 1
+for (i in unique(k_df_valid$subject)) { 
+  k_df_valid$k.adj[k_df_valid$subject == i] = k_df_valid$k[k_df_valid$subject == i] - subject.mean[counter] + sample.mean
+  counter = counter + 1
+}
+
+# Create within-subject error bars
+## standard deviation of adjusted prop.later 
+standard.deviation = tapply(k_df_valid$k.adj, list(as.factor(k_df_valid$prompt), as.factor(k_df_valid$session)), sd)
+
+# get 4 standard errors for each Group 
+standard.error = (standard.deviation)/(sqrt(length(unique(k_df_valid$subject))))
+upper = grouped.mean.k + 1.96*(standard.error)
+lower = grouped.mean.k - 1.96*(standard.error)
+
+bp.k <- barplot2(grouped.mean.k, beside=TRUE, 
+      main="Mean k Discounting Factor \n(Averaged Across 16 Participants)",
+      col=c("lightblue", "mistyrose"), 
+      plot.ci=TRUE, ci.u=upper, ci.l=lower,
+      xlab="Session", ylab="Mean k",
+      legend=c("Describe","Imagine"))
+
+text(bp.k, 0, round(grouped.mean.k,3), cex=1, pos=3)
+```
+
+
+
+## 10. Splitting trials into first half/second half 
+
+What happens when we split the trials into first half/second half and then compare them? 
+
+Within participants: break up trials into 1st half of trials, 2nd half of trials. Check if there's an overall trend for choselater=1. (Do participants get tired of making decisions near the end of the task?)
+
+prop.later in 1st half vs. 2nd half 
+
+It looks like there isn't much of a difference between the trials in the first half and second half. Participants tend to be pretty consistent throughout the experiment session. 
+
+```{r}
+# binary split trials into 1st half (beginning) and 2nd half (end)
+
+# take the mean across participants in a session 
+grouped.mean.beginning <- tapply(split_df$prop.later.beginning, list(as.factor(split_df$session)), mean)
+grouped.mean.beginning
+grouped.mean.end <- tapply(split_df$prop.later.end, list(as.factor(split_df$session)), mean)
+grouped.mean.end
+
+bp.split <- barplot2(c(grouped.mean.beginning,grouped.mean.end), beside=TRUE, 
+      main="Mean Proportion of Choosing Later (trials split)", 
+      #ylim=c(0,1800), 
+      col=c("lightblue", "mistyrose"), 
+      #plot.ci=TRUE, ci.u=upper, ci.l=lower,
+      names.arg = c("No-stress (1st half)", "Stress (1st half)", "No-stress (2nd half)", "Stress (2nd half)"),
+      xlab="Session", ylab="Mean Proportion of Choosing Later Amount")
+
+text(bp.split, 0, round(c(grouped.mean.beginning,grouped.mean.end),3), cex=1, pos=3)
+```
+
+## 11. Reaction Times
+
+Find overall average RT per condition: 
+
+```{r}
+
+ggplot(k_df, aes(x=subject, y=mean.rt, color=prompt)) + 
+  geom_point() + 
+  labs(y = "Mean Reaction Time (ms)", x = "Subject", 
+       title="Average Reaction Times for Choices")
+
+# take the mean across participants in a group 
+grouped.mean.rt <- tapply(k_df$mean.rt, list(as.factor(k_df$prompt), as.factor(k_df$session)), mean)
+grouped.mean.rt
+
+# Remove 'between-subject variability' 
+## within each subject, calculate mean prop.later to average out the 4 sessions per subject
+subject.mean = tapply(k_df$mean.rt, list(as.factor(k_df$subject)), mean)
+sample.mean = mean(k_df$mean.rt)
+
+# normalize prop.later within each subject 
+#k.adj = k - subject.mean + sample.mean
+counter = 1
+for (i in unique(k_df$subject)) { 
+  k_df$mean.rt.adj[k_df$subject == i] = k_df$mean.rt[k_df$subject == i] - subject.mean[counter] + sample.mean
+  counter = counter + 1
+}
+
+# Create within-subject error bars
+## standard deviation of adjusted prop.later 
+standard.deviation = tapply(k_df$mean.rt.adj, list(as.factor(k_df$prompt), as.factor(k_df$session)), sd)
+
+# get 4 standard errors for each Group 
+standard.error = (standard.deviation)/(sqrt(length(unique(k_df$subject))))
+upper = grouped.mean.rt + 1.96*(standard.error)
+lower = grouped.mean.rt - 1.96*(standard.error)
+
+bp.mean.rt <- barplot2(grouped.mean.rt, beside=TRUE, 
+      main="Mean Reaction Time for Choices \n(Averaged Across Participants)", 
+      #ylim=c(0,1800), 
+      col=c("lightblue", "mistyrose"), 
+      plot.ci=TRUE, ci.u=upper, ci.l=lower,
+      #names.arg = c("Stress Imagine", "Stress Describe", "Nostress Imagine", "Nostress Describe"),
+      xlab="Session", ylab="Mean Reaction Time (ms)",
+      legend=c("Describe","Imagine"))
+
+text(bp.mean.rt, 0, round(grouped.mean.rt,3), cex=1, pos=3)
+
+```
+
+
+Interaction plot for order effects (subs with stress first)
+DV: choselater 
+
+
+## 12. Text Response Analysis 
+
+Create a data frame ("text_df") where you organize all the text responses for each participant. 
+Combine to get an aggregate of text responses per participant.
+
+*how many words* the participants write for writeout, whether that corresponds to choices at all (choselater)
+
+Use text analyses (NLP programs; TreeTagger; LIWC) to help analyzes POS, abstract vs. concrete details in txt.
+
+Append all the text responses from each group, feed into POS Tagger, and output proportion of adj, nouns, verbs, etc.
+
+```{r text responses}
+writeout_subdf <- bigdf[bigdf$ttype == 'imagine_writeout' | bigdf$ttype == 'describe_writeout', ]
+
+# edit contents of the cell to just have relevant text 
+writeout_subdf$responses <- str_replace(writeout_subdf$responses, "[}]", "") 
+writeout_subdf$responses <- str_replace(writeout_subdf$responses, "[{]", "") 
+writeout_subdf$responses <- str_replace(writeout_subdf$responses, "writeout", "") 
+writeout_subdf$responses <- str_replace(writeout_subdf$responses, "[:]", "") 
+
+#writeout_responses <- as.character(gsub("writeout", "", writeout_subdf$responses))
+#writeout_responses <- as.character(gsub(":", "", writeout_responses))
+
+text_df = data.frame(subject=writeout_subdf$subject, session=writeout_subdf$sessionlabel,   
+                     prompt=writeout_subdf$ttype, text=writeout_subdf$responses,
+                     amountlater=writeout_subdf$amountlater, delay=writeout_subdf$delay,
+                     scene=writeout_subdf$scene)
+
+# save local copy of text_df
+path_out = '~/Box Sync/Bakkour-Lab/users/hayoung/stress_prospection_data/SONA_prelim_analysis/'
+fileName = paste(path_out, 'text_df.csv', sep='')
+write.csv(text_df, fileName, row.names=FALSE)
+
+numwords <- sapply(strsplit(text_df$text, " "), length) # split response string by spaces & count length of response
+text_df = cbind(text_df, numwords)
+
+# average numwords in imagine_writeout vs. describe_writeout
+# take the mean across participants in a group 
+grouped.mean.numwords <- tapply(text_df$numwords, list(as.factor(text_df$prompt),                       
+                                                       as.factor(text_df$session)), mean)
+grouped.mean.numwords
+
+# Remove 'between-subject variability' 
+subject.mean = tapply(text_df$numwords, list(as.factor(text_df$subject)), mean)
+sample.mean = mean(text_df$numwords)
+
+# normalize prop.later within each subject 
+#k.adj = k - subject.mean + sample.mean
+counter = 1
+for (i in unique(text_df$subject)) { 
+  text_df$numwords.adj[text_df$subject == i] = text_df$numwords[text_df$subject == i] - subject.mean[counter] + sample.mean
+  counter = counter + 1
+}
+
+# Create within-subject error bars
+## standard deviation of adjusted prop.later 
+standard.deviation = tapply(text_df$numwords.adj, list(as.factor(text_df$prompt), as.factor(text_df$session)), sd)
+
+# get 4 standard errors for each Group 
+standard.error = (standard.deviation)/(sqrt(length(unique(text_df$subject))))
+upper = grouped.mean.numwords + 1.96*(standard.error)
+lower = grouped.mean.numwords - 1.96*(standard.error)
+
+bp.mean.numwords <- barplot2(grouped.mean.numwords, beside=TRUE, 
+      main="Mean Number of Words in Text Responses \n(Averaged Across Participants)", 
+      #ylim=c(0,1800), 
+      col=c("lightblue", "mistyrose"), 
+      plot.ci=TRUE, ci.u=upper, ci.l=lower,
+      #names.arg = c("Stress Imagine", "Stress Describe", "Nostress Imagine", "Nostress Describe"),
+      xlab="Session", ylab="Mean Number of Words",
+      legend=c("Describe","Imagine"))
+
+text(bp.mean.numwords, 0, round(grouped.mean.numwords,3), cex=1, pos=3)
+```
+
+### Sentiment Analysis 
+
+Text mining with R using a tidy approach: First, we need to convert text response data (`text_df`) into a tidy text format so that we can pursue questions about word frequency and sentiment analysis / opinion mining. 
+
+Reference: https://www.tidytextmining.com/sentiment.html 
+
+```{r, eval=TRUE}
+
+#restructure as one-token-per-row format 
+tidy_text <- text_df %>%
+  unnest_tokens(word, text)
+
+#remove stop words (extremely common words)
+data(stop_words)
+
+tidy_text <- tidy_text %>%
+  anti_join(stop_words)
+
+#find the most common words in all text responses as a whole 
+# tidy_text %>%
+#   dplyr::count(word, sort = TRUE)
+
+#visualization of most common words
+tidy_text %>%
+  dplyr::count(word, sort = TRUE) %>%
+  filter(n > 40) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word)) +
+  geom_col() +
+  labs(y = NULL)
+
+```
+
+```{r, results="hide"}
+# afinn dictionary 
+afinn <- get_sentiments("afinn")
+
+tidy_text %>%
+  inner_join(afinn) %>%
+  dplyr::count(word, sort = TRUE)
+
+# nrc dictionary 
+nrc_joy <- get_sentiments("nrc") %>% 
+  filter(sentiment == "joy")
+
+tidy_text %>%
+  inner_join(nrc_joy) %>%
+  count(word, sort = TRUE)
+
+# filter(session == "nostress")
+# library(textdata)
+# library(wordcloud)
+# 
+
+```
+
+----------------------------------------------------------------------------------------------
+Note that the `echo = FALSE` parameter is added to the code chunk to prevent printing of the R code that generated the plot.
+
+End of script. 
